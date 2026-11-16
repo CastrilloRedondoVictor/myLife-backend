@@ -3,6 +3,7 @@ import { prisma } from '../db.js';
 import { asyncHandler } from '../lib/async-handler.js';
 import { parseMonth } from '../lib/date.js';
 import { TransactionStatus, TransactionType, type TransactionType as TransactionTypeValue } from '../lib/domain.js';
+import { aggregateDailyCashflow } from '../lib/daily-cashflow.js';
 
 export const dashboardRouter = Router();
 
@@ -52,6 +53,13 @@ dashboardRouter.get('/', asyncHandler(async (request, response) => {
       pending: entries.filter((entry) => entry.status === TransactionStatus.PENDING).length,
     },
     categories: [...byCategory.values()],
+    dailyCashflow: aggregateDailyCashflow(confirmed.map((entry) => ({
+      date: entry.date,
+      type: entry.type,
+      status: entry.status,
+      amount: entry.amount.toNumber(),
+      isFixed: entry.isFixed,
+    }))),
     recentEntries: entries.slice(-8).reverse(),
   });
 }));
