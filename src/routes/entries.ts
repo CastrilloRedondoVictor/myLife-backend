@@ -56,6 +56,8 @@ entriesRouter.patch('/:id', asyncHandler(async (request, response) => {
   const input = entryUpdateSchema.parse(request.body);
   const existing = await prisma.financialEntry.findUnique({ where: { id } });
   if (!existing) throw new ApiError(404, 'No se encontró el movimiento.');
+  const linkedReceipt = await prisma.shoppingReceipt.findUnique({ where: { financialEntryId: id }, select: { id: true } });
+  if (linkedReceipt) throw new ApiError(409, 'Este movimiento pertenece a un ticket. Edita el importe desde la sección Compras.');
 
   if (input.categoryId || input.type) {
     const category = await prisma.category.findUnique({ where: { id: input.categoryId ?? existing.categoryId } });
@@ -80,6 +82,8 @@ entriesRouter.patch('/:id/confirm', asyncHandler(async (request, response) => {
 
 entriesRouter.delete('/:id', asyncHandler(async (request, response) => {
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
+  const linkedReceipt = await prisma.shoppingReceipt.findUnique({ where: { financialEntryId: id }, select: { id: true } });
+  if (linkedReceipt) throw new ApiError(409, 'Este movimiento pertenece a un ticket. Elimínalo desde la sección Compras para mantener los datos sincronizados.');
   await prisma.financialEntry.delete({ where: { id } });
   response.status(204).end();
 }));

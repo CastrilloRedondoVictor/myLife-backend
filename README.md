@@ -25,10 +25,22 @@ API local de finanzas personales para el frontend de MyLife. Este repositorio es
 1. Instala Node.js 20.19 o 22 y npm.
 2. Copia `.env.example` a `.env` y sustituye los datos de conexión. No guardes `.env` en Git.
 3. En Azure SQL, configura el firewall para permitir solo tu IP pública actual. Usa autenticación SQL y TLS; no uses las credenciales administrativas del servidor para la aplicación.
-4. `npm install` y `npm run db:generate`. Para la primera instalación manual, ejecuta una sola vez `prisma/migrations/20261116000000_init/migration.sql` desde el editor SQL conectado a la base `mylife`; después, desde `backend`, registra que ya se aplicó con `npx prisma migrate resolve --applied 20261116000000_init` y carga categorías con `npm run db:seed`.
+4. `npm install` y `npm run db:generate`. Para una base nueva, ejecuta una sola vez `prisma/migrations/20261116000000_init/migration.sql` desde el editor SQL conectado a la base `mylife`; después, desde `backend`, registra que ya se aplicó con `npx prisma migrate resolve --applied 20261116000000_init` y carga categorías con `npm run db:seed`.
 5. `npm run dev`. API: `http://127.0.0.1:4000/api`; salud: `/api/health`.
 
 No ejecutes `db:deploy` para la migración inicial si ya la aplicaste a mano: primero debes registrarla con `migrate resolve`, para evitar que Prisma intente crear las tablas otra vez. La migración inicial SQL Server corresponde a una base nueva y no migra datos de PostgreSQL. No apuntes los tests a datos personales.
+
+### Activar la funcionalidad de Compras en una base existente
+
+Las migraciones de Compras son aditivas. La primera crea las tablas e índices; la siguiente añade el contador de unidades compradas a los tickets ya existentes. No se ejecutan automáticamente contra Azure ni contra datos personales.
+
+Si las tablas de Compras ya existen pero aparece que falta `unitsPurchased`, detén el backend, haz una copia de seguridad y ejecuta **solo** `prisma/migrations/20261116020000_shopping_units_purchased/migration.sql` en la base correcta. El script pone el valor `1` en las líneas antiguas y no pierde sus datos. No vuelvas a ejecutar la migración `20261116010000_shopping`.
+
+Tras ejecutar correctamente el script, registra la migración con `npx prisma migrate resolve --applied 20261116020000_shopping_units_purchased` y reinicia el backend. Si la migración anterior se ejecutó manualmente pero aún no se registró en Prisma, registra primero `20261116010000_shopping` con `npx prisma migrate resolve --applied 20261116010000_shopping`.
+
+Para una base nueva, ejecuta en orden los scripts `20261116010000_shopping` y `20261116020000_shopping_units_purchased`, y registra ambos como aplicados. No ejecutes `db:deploy` sin revisar el estado de la base. Si un script falla, su transacción intenta revertir los cambios; no marques esa migración como aplicada.
+
+No ejecutes `db:deploy` para esta base antes de revisar su estado. Si el script falla, su transacción intenta revertir los cambios; no marques la migración como aplicada y revisa el error antes de reintentar.
 
 ## Recursos Azure manuales
 
@@ -55,6 +67,13 @@ Prefijo `/api`; JSON; errores `{ "error": "..." }` (validación incluye `details
 | `PATCH /recurring/:id` | Cambiar `{active:boolean}`. `DELETE /recurring/:id` elimina la regla; los movimientos conservan su marca fija histórica. |
 | `GET /budgets?month=YYYY-MM`, `PUT /budgets` | Consultar/guardar límite por categoría. Alta `{categoryId,month,limitAmount}`; respuesta de consulta añade `spent`. |
 | `DELETE /budgets/:id` | Eliminar presupuesto. |
+| `GET /shopping/supermarkets?includeArchived=true`, `POST /shopping/supermarkets`, `PATCH /shopping/supermarkets/:id` | Listar, crear, archivar o restaurar supermercados. |
+| `GET /shopping/products?q=...&includeArchived=true`, `POST /shopping/products`, `PATCH /shopping/products/:id` | Buscar, crear, archivar o restaurar productos genéricos; la búsqueda incluye variantes y sus últimos datos de compra. |
+| `GET /shopping/list`, `POST /shopping/list`, `PATCH /shopping/list/:id`, `DELETE /shopping/list/:id` | Gestionar la lista pendiente; el borrado del elemento equivale a marcarlo como comprado. |
+| `GET /shopping/receipts`, `POST /shopping/receipts`, `PATCH /shopping/receipts/:id`, `DELETE /shopping/receipts/:id` | Consultar y mantener tickets con líneas, tienda, fecha, categoría, ajuste y total; crear/actualizar/eliminar el movimiento enlazado en la misma transacción. |
+| `GET /shopping/compare/:productId` | Devolver el precio comparable más reciente por variante y tienda, la mejor variante por tienda y observaciones de los últimos 12 meses. |
+
+Cada línea acepta el número de unidades/envases comprados, la cantidad contenida en cada unidad y el importe total pagado por todas ellas; así no es necesario repetir un mismo producto. Las cantidades agregadas de peso y volumen se normalizan internamente a gramos y mililitros; también se conserva la unidad introducida para editar el ticket. La comparación se expresa en €/kg, €/l o €/unidad según la primera compra registrada para el producto genérico. El ticket crea un único gasto confirmado por su total final, no un movimiento por producto. Las operaciones de ticket y movimiento son atómicas; no edites ni elimines desde `/entries` un movimiento enlazado a un ticket.
 
 El origen CORS se limita a `FRONTEND_ORIGIN`. En producción, el API aún requiere autenticación antes de exponerse.
 

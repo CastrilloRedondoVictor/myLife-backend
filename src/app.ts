@@ -8,6 +8,7 @@ import { categoriesRouter } from './routes/categories.js';
 import { entriesRouter } from './routes/entries.js';
 import { recurringRouter } from './routes/recurring.js';
 import { budgetsRouter } from './routes/budgets.js';
+import { shoppingRouter } from './routes/shopping.js';
 
 export const app = express();
 app.disable('x-powered-by');
@@ -20,5 +21,6 @@ app.use('/api/categories', categoriesRouter);
 app.use('/api/entries', entriesRouter);
 app.use('/api/recurring', recurringRouter);
 app.use('/api/budgets', budgetsRouter);
+app.use('/api/shopping', shoppingRouter);
 app.use((_request, response) => response.status(404).json({ error: 'Ruta no encontrada.' }));
 app.use(errorHandler);
