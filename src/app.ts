@@ -1,0 +1,24 @@
+import cors from 'cors';
+import express from 'express';
+import helmet from 'helmet';
+import { config } from './config.js';
+import { errorHandler } from './lib/errors.js';
+import { dashboardRouter } from './routes/dashboard.js';
+import { categoriesRouter } from './routes/categories.js';
+import { entriesRouter } from './routes/entries.js';
+import { recurringRouter } from './routes/recurring.js';
+import { budgetsRouter } from './routes/budgets.js';
+
+export const app = express();
+app.disable('x-powered-by');
+app.use(helmet());
+app.use(cors({ origin: config.FRONTEND_ORIGIN }));
+app.use(express.json({ limit: '100kb' }));
+app.get('/api/health', (_request, response) => response.json({ status: 'ok' }));
+app.use('/api/dashboard', dashboardRouter);
+app.use('/api/categories', categoriesRouter);
+app.use('/api/entries', entriesRouter);
+app.use('/api/recurring', recurringRouter);
+app.use('/api/budgets', budgetsRouter);
+app.use((_request, response) => response.status(404).json({ error: 'Ruta no encontrada.' }));
+app.use(errorHandler);
