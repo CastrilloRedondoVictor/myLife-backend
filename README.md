@@ -23,6 +23,12 @@ API de finanzas personales y compartidas para MyLife. Este repositorio es indepe
 
 ## Configuración local
 
+### Base de datos nueva (vacía)
+
+Para empezar desde cero, crea primero una base vacía en SQL Server/Azure SQL y ejecuta `prisma/sql/create-database.sql` conectado a esa base. El script crea el esquema final de MyLife —tablas, índices, restricciones y relaciones—, pero no crea el recurso de Azure ni inserta usuarios o datos iniciales. No ejecutes las migraciones encima de esta base: el script ya incluye su resultado. Para que Prisma reconozca ese esquema como baseline, registra las migraciones en orden con `npx prisma migrate resolve --applied <nombre>` (`20261116000000_init`, `20261116010000_shopping`, `20261116020000_shopping_units_purchased`, `20261117000000_identity_tenancy`) y comprueba `npx prisma migrate status`. Una base recién creada no necesita backfill legacy; verifica el esquema y el estado de Prisma antes de habilitar `TENANT_DATA_READY`.
+
+Los pasos siguientes de esta sección describen la preparación de una base existente con datos legacy. No ejecutes el backfill sobre una base vacía creada con el script anterior.
+
 1. Instala Node.js 20.19 o 22 y npm. Copia `.env.example` a `.env` y configura la cadena de conexión solo en tu entorno local; no guardes `.env` en Git.
 2. Registra una aplicación OAuth de Google para desarrollo con callback `http://localhost:4000/api/auth/google/callback`. Configura `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OIDC_REDIRECT_URI` y `FRONTEND_ORIGIN` localmente. No compartas ni incluyas credenciales en logs o documentación.
 3. Ejecuta `npm install` y `npm run db:generate`. La generación del cliente es local y no migra ni accede por sí misma a la base.
