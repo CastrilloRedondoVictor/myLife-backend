@@ -10,11 +10,12 @@ export const budgetsRouter = Router();
 
 budgetsRouter.get('/', asyncHandler(async (request, response) => {
   const month = parseMonth(typeof request.query.month === 'string' ? request.query.month : undefined);
-  const budgets = await prisma.budget.findMany({ where: { month }, include: { category: true }, orderBy: { category: { name: 'asc' } } });
+  const spaceId = request.space!.spaceId;
+  const budgets = await prisma.budget.findMany({ where: { spaceId, month }, include: { category: true }, orderBy: { category: { name: 'asc' } } });
   const nextMonth = new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1));
   const expenses = await prisma.financialEntry.groupBy({
     by: ['categoryId'],
-    where: { type: TransactionType.EXPENSE, status: 'CONFIRMED', date: { gte: month, lt: nextMonth } },
+    where: { spaceId, voidedAt: null, type: TransactionType.EXPENSE, status: 'CONFIRMED', date: { gte: month, lt: nextMonth } },
     _sum: { amount: true },
   });
   const spentByCategory = new Map(expenses.map((item) => [item.categoryId, item._sum.amount?.toNumber() ?? 0]));
@@ -28,11 +29,12 @@ budgetsRouter.put('/', asyncHandler(async (request, response) => {
     limitAmount: z.coerce.number().finite().positive().max(9999999999.99),
   }).parse(request.body);
   const month = parseMonth(input.month);
-  const category = await prisma.category.findUniqueOrThrow({ where: { id: input.categoryId } });
+  const category = await prisma.category.findFirst({ where: { id: input.categoryId, spaceId: request.space!.spaceId } });
+  if (!category) throw new ApiError(404, 'No se encontró la categoría.');
   if (category.type !== TransactionType.EXPENSE) throw new ApiError(400, 'El presupuesto solo puede asociarse a una categoría de gasto.');
   const budget = await prisma.budget.upsert({
     where: { categoryId_month: { categoryId: input.categoryId, month } },
-    create: { categoryId: input.categoryId, month, limitAmount: input.limitAmount },
+    create: { categoryId: input.categoryId, month, limitAmount: input.limitAmount, spaceId: request.space!.spaceId },
     update: { limitAmount: input.limitAmount },
     include: { category: true },
   });
@@ -47,7 +49,10 @@ budgetsRouter.patch('/:id', asyncHandler(async (request, response) => {
     limitAmount: z.coerce.number().finite().positive().max(9999999999.99),
   }).parse(request.body);
   const month = parseMonth(input.month);
-  const category = await prisma.category.findUniqueOrThrow({ where: { id: input.categoryId } });
+  const existing = await prisma.budget.findFirst({ where: { id, spaceId: request.space!.spaceId } });
+  if (!existing) throw new ApiError(404, 'No se encontró el presupuesto.');
+  const category = await prisma.category.findFirst({ where: { id: input.categoryId, spaceId: request.space!.spaceId } });
+  if (!category) throw new ApiError(404, 'No se encontró la categoría.');
   if (category.type !== TransactionType.EXPENSE) throw new ApiError(400, 'El presupuesto solo puede asociarse a una categoría de gasto.');
   const budget = await prisma.budget.update({
     where: { id },
@@ -59,6 +64,8 @@ budgetsRouter.patch('/:id', asyncHandler(async (request, response) => {
 
 budgetsRouter.delete('/:id', asyncHandler(async (request, response) => {
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
+  const existing = await prisma.budget.findFirst({ where: { id, spaceId: request.space!.spaceId } });
+  if (!existing) throw new ApiError(404, 'No se encontró el presupuesto.');
   await prisma.budget.delete({ where: { id } });
   response.status(204).end();
 }));

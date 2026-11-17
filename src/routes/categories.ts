@@ -16,20 +16,23 @@ const categoryUpdateSchema = categorySchema.omit({ type: true }).partial().refin
   message: 'Indica al menos un campo para actualizar.',
 });
 
-categoriesRouter.get('/', asyncHandler(async (_request, response) => {
-  const categories = await prisma.category.findMany({ orderBy: [{ type: 'asc' }, { name: 'asc' }] });
+categoriesRouter.get('/', asyncHandler(async (request, response) => {
+  const categories = await prisma.category.findMany({ where: { spaceId: request.space!.spaceId }, orderBy: [{ type: 'asc' }, { name: 'asc' }] });
   response.json(categories);
 }));
 
 categoriesRouter.post('/', asyncHandler(async (request, response) => {
   const input = categorySchema.parse(request.body);
-  const category = await prisma.category.create({ data: input });
+  const category = await prisma.category.create({ data: { ...input, spaceId: request.space!.spaceId } });
   response.status(201).json(category);
 }));
 
 categoriesRouter.patch('/:id', asyncHandler(async (request, response) => {
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
   const input = categoryUpdateSchema.parse(request.body);
+  const existing = await prisma.category.findFirst({ where: { id, spaceId: request.space!.spaceId } });
+  if (!existing) throw new ApiError(404, 'No se encontró la categoría.');
+  if (existing.sourceCoLifeSpaceId) throw new ApiError(409, 'Esta categoría automática se gestiona desde su CoLife.');
   const category = await prisma.category.update({ where: { id }, data: input });
   response.json(category);
 }));
@@ -37,7 +40,7 @@ categoriesRouter.patch('/:id', asyncHandler(async (request, response) => {
 categoriesRouter.delete('/:id', asyncHandler(async (request, response) => {
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
   const category = await prisma.category.findUnique({
-    where: { id },
+    where: { id, spaceId: request.space!.spaceId },
     include: { _count: { select: { transactions: true, recurringRules: true, budgets: true } } },
   });
   if (!category) throw new ApiError(404, 'No se encontró la categoría.');

@@ -11,7 +11,7 @@ dashboardRouter.get('/', asyncHandler(async (request, response) => {
   const month = parseMonth(typeof request.query.month === 'string' ? request.query.month : undefined);
   const nextMonth = new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1));
   const entries = await prisma.financialEntry.findMany({
-    where: { date: { gte: month, lt: nextMonth } },
+    where: { spaceId: request.space!.spaceId, voidedAt: null, date: { gte: month, lt: nextMonth } },
     include: { category: true },
     orderBy: { date: 'asc' },
   });
@@ -21,7 +21,7 @@ dashboardRouter.get('/', asyncHandler(async (request, response) => {
     .reduce((sum, entry) => sum + entry.amount.toNumber(), 0);
   const balanceAggregate = await prisma.financialEntry.groupBy({
     by: ['type'],
-    where: { status: TransactionStatus.CONFIRMED },
+    where: { spaceId: request.space!.spaceId, voidedAt: null, status: TransactionStatus.CONFIRMED },
     _sum: { amount: true },
   });
   const incomeToDate = balanceAggregate.find((entry) => entry.type === TransactionType.INCOME)?._sum.amount?.toNumber() ?? 0;

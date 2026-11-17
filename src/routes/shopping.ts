@@ -1,11 +1,13 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../db.js';
 import { asyncHandler } from '../lib/async-handler.js';
 import { ApiError } from '../lib/api-error.js';
 import { TransactionStatus, TransactionType } from '../lib/domain.js';
 import { dimensionForUnit, moneyToCents, normalizeShoppingName, pricePerStandard, shoppingUnits, toBaseQuantity, type ShoppingDimension, type ShoppingUnit } from '../lib/shopping-domain.js';
+import { allocateExpense, type AllocationInput, type AllocationMode } from '../lib/shared-expense.js';
+import { assertActiveCoLifeMembers, centsToDecimal, reconcileSettledExpenseCorrection, syncExpenseShares, syncPersonalMirror } from '../lib/shared-ledger.js';
 
 export const shoppingRouter = Router();
 const dimensions = ['WEIGHT', 'VOLUME', 'COUNT'] as const;
@@ -26,8 +28,14 @@ const receiptSchema = z.object({
   categoryId: z.string().min(1),
   date: z.coerce.date(),
   adjustment: money.default(0),
+  splitMode: z.enum(['EQUAL', 'PERCENTAGE', 'EXACT']).optional(),
+  participants: z.array(z.object({
+    userId: z.string().min(1).max(30),
+    shareBasis: z.number().int().min(1).max(10_000).optional(),
+    amountCents: z.number().int().positive().max(999_999_999_999).optional(),
+  })).min(1).max(100).optional(),
   items: z.array(receiptItemSchema).min(1).max(150),
-});
+}).refine((value) => (value.splitMode === undefined) === (value.participants === undefined), { message: 'El tipo de reparto y los participantes deben enviarse juntos.' });
 
 function variantKeys(brand?: string | null, packageLabel?: string | null) {
   const normalizedBrand = brand ? normalizeShoppingName(brand) : '';
@@ -40,18 +48,18 @@ function variantKeys(brand?: string | null, packageLabel?: string | null) {
   };
 }
 
-async function getOrCreateSupermarket(tx: Prisma.TransactionClient, name: string) {
+async function getOrCreateSupermarket(tx: Prisma.TransactionClient, name: string, spaceId: string) {
   const normalizedName = normalizeShoppingName(name);
-  const existing = await tx.supermarket.findUnique({ where: { normalizedName } });
+  const existing = await tx.supermarket.findUnique({ where: { spaceId_normalizedName: { spaceId, normalizedName } } });
   if (existing) {
     return existing.active ? existing : tx.supermarket.update({ where: { id: existing.id }, data: { active: true } });
   }
-  return tx.supermarket.create({ data: { name: name.trim(), normalizedName } });
+  return tx.supermarket.create({ data: { name: name.trim(), normalizedName, spaceId } });
 }
 
-async function replaceReceiptItems(tx: Prisma.TransactionClient, receiptId: string, items: z.infer<typeof receiptItemSchema>[]) {
+async function replaceReceiptItems(tx: Prisma.TransactionClient, receiptId: string, spaceId: string, items: z.infer<typeof receiptItemSchema>[]) {
   const dimensionsByProduct = new Map<string, string>();
-  const rows: Array<{ productId: string; variantId: string; unit: ShoppingUnit; unitsPurchased: number; quantityBase: number; amount: number }> = [];
+  const rows: Array<{ spaceId: string; productId: string; variantId: string; unit: ShoppingUnit; unitsPurchased: number; quantityBase: number; amount: number }> = [];
   let linesCents = 0;
 
   for (const item of items) {
@@ -62,7 +70,7 @@ async function replaceReceiptItems(tx: Prisma.TransactionClient, receiptId: stri
     }
     dimensionsByProduct.set(item.productId, dimension);
 
-    const product = await tx.shoppingProduct.findUnique({ where: { id: item.productId } });
+    const product = await tx.shoppingProduct.findFirst({ where: { id: item.productId, spaceId } });
     if (!product || !product.active) throw new ApiError(400, 'Uno de los productos no existe o está archivado.');
     if (product.dimension && product.dimension !== dimension) {
       throw new ApiError(400, `La unidad no coincide con la dimensión guardada para «${product.name}».`);
@@ -73,11 +81,11 @@ async function replaceReceiptItems(tx: Prisma.TransactionClient, receiptId: stri
 
     const keys = variantKeys(item.brand, item.packageLabel);
     const variant = await tx.shoppingVariant.upsert({
-      where: { productId_normalizedBrand_normalizedPackage: { productId: product.id, normalizedBrand: keys.normalizedBrand, normalizedPackage: keys.normalizedPackage } },
-      create: { productId: product.id, ...keys },
+      where: { spaceId_productId_normalizedBrand_normalizedPackage: { spaceId, productId: product.id, normalizedBrand: keys.normalizedBrand, normalizedPackage: keys.normalizedPackage } },
+      create: { spaceId, productId: product.id, ...keys },
       update: { active: true, brand: keys.brand, packageLabel: keys.packageLabel },
     });
-    rows.push({ productId: product.id, variantId: variant.id, unit: item.unit, unitsPurchased: item.unitsPurchased, quantityBase: toBaseQuantity(item.quantity, item.unit, item.unitsPurchased), amount: item.amount });
+    rows.push({ spaceId, productId: product.id, variantId: variant.id, unit: item.unit, unitsPurchased: item.unitsPurchased, quantityBase: toBaseQuantity(item.quantity, item.unit, item.unitsPurchased), amount: item.amount });
     linesCents += moneyToCents(item.amount);
   }
 
@@ -87,20 +95,21 @@ async function replaceReceiptItems(tx: Prisma.TransactionClient, receiptId: stri
 
 shoppingRouter.get('/supermarkets', asyncHandler(async (request, response) => {
   const { includeArchived } = z.object({ includeArchived: z.enum(['true', 'false']).default('false') }).parse(request.query);
-  const supermarkets = await prisma.supermarket.findMany({ where: includeArchived === 'true' ? {} : { active: true }, orderBy: { name: 'asc' } });
+  const supermarkets = await prisma.supermarket.findMany({ where: { spaceId: request.space!.spaceId, ...(includeArchived === 'true' ? {} : { active: true }) }, orderBy: { name: 'asc' } });
   response.json(supermarkets);
 }));
 
 shoppingRouter.post('/supermarkets', asyncHandler(async (request, response) => {
   const { name } = z.object({ name: z.string().trim().min(1).max(80) }).parse(request.body);
   const normalizedName = normalizeShoppingName(name);
-  const existing = await prisma.supermarket.findUnique({ where: { normalizedName } });
+  const spaceId = request.space!.spaceId;
+  const existing = await prisma.supermarket.findUnique({ where: { spaceId_normalizedName: { spaceId, normalizedName } } });
   if (existing) {
     const supermarket = existing.active ? existing : await prisma.supermarket.update({ where: { id: existing.id }, data: { active: true } });
     response.json(supermarket);
     return;
   }
-  const supermarket = await prisma.supermarket.create({ data: { name, normalizedName } });
+  const supermarket = await prisma.supermarket.create({ data: { name, normalizedName, spaceId } });
   response.status(201).json(supermarket);
 }));
 
@@ -108,8 +117,10 @@ shoppingRouter.patch('/supermarkets/:id', asyncHandler(async (request, response)
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
   const input = z.object({ name: z.string().trim().min(1).max(80).optional(), active: z.boolean().optional() })
     .refine((value) => Object.keys(value).length > 0).parse(request.body);
+  const existing = await prisma.supermarket.findFirst({ where: { id, spaceId: request.space!.spaceId } });
+  if (!existing) throw new ApiError(404, 'No se encontró el supermercado.');
   if (input.name) {
-    const duplicate = await prisma.supermarket.findUnique({ where: { normalizedName: normalizeShoppingName(input.name) } });
+    const duplicate = await prisma.supermarket.findUnique({ where: { spaceId_normalizedName: { spaceId: request.space!.spaceId, normalizedName: normalizeShoppingName(input.name) } } });
     if (duplicate && duplicate.id !== id) throw new ApiError(409, `Ya existe el supermercado «${duplicate.name}».`);
   }
   const supermarket = await prisma.supermarket.update({
@@ -123,13 +134,14 @@ shoppingRouter.get('/products', asyncHandler(async (request, response) => {
   const query = z.object({ q: z.string().trim().max(100).optional(), includeArchived: z.enum(['true', 'false']).default('false') }).parse(request.query);
   const normalizedQuery = query.q ? normalizeShoppingName(query.q) : '';
   const products = await prisma.shoppingProduct.findMany({
-    where: { ...(query.includeArchived === 'true' ? {} : { active: true }), ...(normalizedQuery ? { normalizedName: { contains: normalizedQuery } } : {}) },
+    where: { spaceId: request.space!.spaceId, ...(query.includeArchived === 'true' ? {} : { active: true }), ...(normalizedQuery ? { normalizedName: { contains: normalizedQuery } } : {}) },
     include: {
       variants: {
-        where: { active: true },
+        where: { spaceId: request.space!.spaceId, active: true },
         orderBy: { brand: 'asc' },
         include: {
           receiptItems: {
+            where: { spaceId: request.space!.spaceId, receipt: { voidedAt: null } },
             orderBy: [{ receipt: { date: 'desc' } }, { createdAt: 'desc' }],
             take: 1,
             select: { unit: true, unitsPurchased: true, quantityBase: true, amount: true, receipt: { select: { date: true } } },
@@ -161,9 +173,10 @@ shoppingRouter.get('/products', asyncHandler(async (request, response) => {
 shoppingRouter.post('/products', asyncHandler(async (request, response) => {
   const input = z.object({ name: productNameSchema, dimension: z.enum(dimensions).optional() }).parse(request.body);
   const normalizedName = normalizeShoppingName(input.name);
-  const existing = await prisma.shoppingProduct.findUnique({ where: { normalizedName } });
+  const spaceId = request.space!.spaceId;
+  const existing = await prisma.shoppingProduct.findUnique({ where: { spaceId_normalizedName: { spaceId, normalizedName } } });
   if (existing) throw new ApiError(409, `Ya existe «${existing.name}». Selecciónalo para reutilizarlo.`);
-  const product = await prisma.shoppingProduct.create({ data: { name: input.name, normalizedName, dimension: input.dimension } });
+  const product = await prisma.shoppingProduct.create({ data: { name: input.name, normalizedName, dimension: input.dimension, spaceId } });
   response.status(201).json(product);
 }));
 
@@ -171,8 +184,10 @@ shoppingRouter.patch('/products/:id', asyncHandler(async (request, response) => 
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
   const input = z.object({ name: productNameSchema.optional(), active: z.boolean().optional() })
     .refine((value) => Object.keys(value).length > 0).parse(request.body);
+  const existing = await prisma.shoppingProduct.findFirst({ where: { id, spaceId: request.space!.spaceId } });
+  if (!existing) throw new ApiError(404, 'No se encontró el producto.');
   if (input.name) {
-    const duplicate = await prisma.shoppingProduct.findUnique({ where: { normalizedName: normalizeShoppingName(input.name) } });
+    const duplicate = await prisma.shoppingProduct.findUnique({ where: { spaceId_normalizedName: { spaceId: request.space!.spaceId, normalizedName: normalizeShoppingName(input.name) } } });
     if (duplicate && duplicate.id !== id) throw new ApiError(409, `Ya existe el producto «${duplicate.name}».`);
   }
   const product = await prisma.shoppingProduct.update({
@@ -182,8 +197,9 @@ shoppingRouter.patch('/products/:id', asyncHandler(async (request, response) => 
   response.json(product);
 }));
 
-shoppingRouter.get('/list', asyncHandler(async (_request, response) => {
+shoppingRouter.get('/list', asyncHandler(async (request, response) => {
   const items = await prisma.shoppingListItem.findMany({
+    where: { spaceId: request.space!.spaceId },
     include: { product: { include: { variants: { where: { active: true } } } } },
     orderBy: { createdAt: 'asc' },
   });
@@ -192,11 +208,12 @@ shoppingRouter.get('/list', asyncHandler(async (_request, response) => {
 
 shoppingRouter.post('/list', asyncHandler(async (request, response) => {
   const input = z.object({ productId: z.string().min(1), note: z.string().trim().max(160).optional().nullable() }).parse(request.body);
-  const product = await prisma.shoppingProduct.findUnique({ where: { id: input.productId } });
+  const spaceId = request.space!.spaceId;
+  const product = await prisma.shoppingProduct.findFirst({ where: { id: input.productId, spaceId } });
   if (!product || !product.active) throw new ApiError(404, 'No se encontró el producto activo.');
   const item = await prisma.shoppingListItem.upsert({
     where: { productId: input.productId },
-    create: input,
+    create: { ...input, spaceId },
     update: { note: input.note || null },
     include: { product: true },
   });
@@ -206,21 +223,26 @@ shoppingRouter.post('/list', asyncHandler(async (request, response) => {
 shoppingRouter.patch('/list/:id', asyncHandler(async (request, response) => {
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
   const { note } = z.object({ note: z.string().trim().max(160).nullable() }).parse(request.body);
+  const existing = await prisma.shoppingListItem.findFirst({ where: { id, spaceId: request.space!.spaceId } });
+  if (!existing) throw new ApiError(404, 'No se encontró el elemento de la lista.');
   const item = await prisma.shoppingListItem.update({ where: { id }, data: { note: note || null }, include: { product: true } });
   response.json(item);
 }));
 
 shoppingRouter.delete('/list/:id', asyncHandler(async (request, response) => {
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
+  const existing = await prisma.shoppingListItem.findFirst({ where: { id, spaceId: request.space!.spaceId } });
+  if (!existing) throw new ApiError(404, 'No se encontró el elemento de la lista.');
   await prisma.shoppingListItem.delete({ where: { id } });
   response.status(204).end();
 }));
 
-shoppingRouter.get('/receipts', asyncHandler(async (_request, response) => {
+shoppingRouter.get('/receipts', asyncHandler(async (request, response) => {
   const receipts = await prisma.shoppingReceipt.findMany({
+    where: { spaceId: request.space!.spaceId, voidedAt: null },
     include: {
       supermarket: true,
-      financialEntry: { include: { category: true } },
+      financialEntry: { include: { category: true, shares: { where: { isActive: true }, include: { user: { select: { id: true, email: true, displayName: true } } } } } },
       items: { include: { product: true, variant: true }, orderBy: { createdAt: 'asc' } },
     },
     orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
@@ -231,26 +253,46 @@ shoppingRouter.get('/receipts', asyncHandler(async (_request, response) => {
 
 shoppingRouter.post('/receipts', asyncHandler(async (request, response) => {
   const input = receiptSchema.parse(request.body);
+  const spaceId = request.space!.spaceId;
+  const isCoLife = request.space!.spaceType === 'COLIFE';
   const lineCents = input.items.reduce((sum, item) => sum + moneyToCents(item.amount), 0);
   const totalCents = lineCents + moneyToCents(input.adjustment);
   if (totalCents <= 0 || totalCents > 999999999999) throw new ApiError(400, 'El total del ticket debe ser mayor que cero y estar dentro del límite admitido.');
+  if (isCoLife && (!input.splitMode || !input.participants)) throw new ApiError(400, 'Un ticket CoLife necesita pagador y participantes del reparto.');
+  if (!isCoLife && input.splitMode) throw new ApiError(400, 'El reparto solo está disponible en tickets CoLife.');
+  if (isCoLife && input.splitMode !== 'EQUAL') throw new ApiError(400, 'Los tickets CoLife admiten actualmente reparto igualitario.');
+  let allocations: ReturnType<typeof allocateExpense> = [];
+  if (isCoLife) {
+    try {
+      allocations = allocateExpense(totalCents, input.splitMode as AllocationMode, input.participants as AllocationInput[]);
+    } catch (error) {
+      if (error instanceof RangeError) throw new ApiError(400, error.message);
+      throw error;
+    }
+  }
 
   const receipt = await prisma.$transaction(async (tx) => {
-    const category = await tx.category.findUnique({ where: { id: input.categoryId } });
+    const groupSpace = isCoLife ? await tx.space.findUnique({ where: { id: spaceId } }) : null;
+    if (isCoLife && !groupSpace) throw new ApiError(404, 'No se encontró el CoLife.');
+    const category = await tx.category.findFirst({ where: { id: input.categoryId, spaceId } });
     if (!category || category.type !== TransactionType.EXPENSE) throw new ApiError(400, 'Elige una categoría de gasto válida.');
-    const supermarket = await getOrCreateSupermarket(tx, input.supermarketName);
+    if (isCoLife) await assertActiveCoLifeMembers(tx, spaceId, [request.auth!.userId, ...allocations.map(({ userId }) => userId)]);
+    const supermarket = await getOrCreateSupermarket(tx, input.supermarketName, spaceId);
     const financialEntry = await tx.financialEntry.create({
       data: {
         type: TransactionType.EXPENSE,
         status: TransactionStatus.CONFIRMED,
-        amount: totalCents / 100,
+        amount: centsToDecimal(totalCents),
         description: `Compra ${supermarket.name}`.slice(0, 160),
         date: input.date,
         categoryId: category.id,
+        spaceId,
+        payerUserId: isCoLife ? request.auth!.userId : null,
       },
     });
     const created = await tx.shoppingReceipt.create({
       data: {
+        spaceId,
         supermarketId: supermarket.id,
         financialEntryId: financialEntry.id,
         date: input.date,
@@ -258,11 +300,43 @@ shoppingRouter.post('/receipts', asyncHandler(async (request, response) => {
         totalAmount: totalCents / 100,
       },
     });
-    const actualLineCents = await replaceReceiptItems(tx, created.id, input.items);
+    const actualLineCents = await replaceReceiptItems(tx, created.id, spaceId, input.items);
     if (actualLineCents !== lineCents) throw new ApiError(400, 'No se pudieron validar los importes de las líneas.');
+    if (isCoLife && groupSpace) {
+      await syncExpenseShares(tx, {
+        entryId: financialEntry.id,
+        groupSpace,
+        mode: input.splitMode as AllocationMode,
+        description: financialEntry.description,
+        date: financialEntry.date,
+        allocations,
+      });
+      await tx.auditEvent.create({
+        data: {
+          spaceId,
+          actorId: request.auth!.userId,
+          entityType: 'SHARED_EXPENSE',
+          entityId: financialEntry.id,
+          action: 'CREATED_FROM_RECEIPT',
+          details: JSON.stringify({ receiptId: created.id, totalCents, payerUserId: request.auth!.userId, splitMode: input.splitMode, allocations }),
+        },
+      });
+    }
     return tx.shoppingReceipt.findUniqueOrThrow({
       where: { id: created.id },
-      include: { supermarket: true, financialEntry: { include: { category: true } }, items: { include: { product: true, variant: true } } },
+      include: {
+        supermarket: true,
+        financialEntry: {
+          include: {
+            category: true,
+            shares: {
+              where: { isActive: true },
+              include: { user: { select: { id: true, email: true, displayName: true } } },
+            },
+          },
+        },
+        items: { include: { product: true, variant: true } },
+      },
     });
   });
   response.status(201).json(receipt);
@@ -271,47 +345,162 @@ shoppingRouter.post('/receipts', asyncHandler(async (request, response) => {
 shoppingRouter.patch('/receipts/:id', asyncHandler(async (request, response) => {
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
   const input = receiptSchema.parse(request.body);
+  const isCoLife = request.space!.spaceType === 'COLIFE';
   const lineCents = input.items.reduce((sum, item) => sum + moneyToCents(item.amount), 0);
   const totalCents = lineCents + moneyToCents(input.adjustment);
   if (totalCents <= 0 || totalCents > 999999999999) throw new ApiError(400, 'El total del ticket debe ser mayor que cero y estar dentro del límite admitido.');
+  if (isCoLife && (!input.splitMode || !input.participants)) throw new ApiError(400, 'Un ticket CoLife necesita pagador y participantes del reparto.');
+  if (!isCoLife && input.splitMode) throw new ApiError(400, 'El reparto solo está disponible en tickets CoLife.');
+  if (isCoLife && input.splitMode !== 'EQUAL') throw new ApiError(400, 'Los tickets CoLife admiten actualmente reparto igualitario.');
+  let allocations: ReturnType<typeof allocateExpense> = [];
+  if (isCoLife) {
+    try {
+      allocations = allocateExpense(totalCents, input.splitMode as AllocationMode, input.participants as AllocationInput[]);
+    } catch (error) {
+      if (error instanceof RangeError) throw new ApiError(400, error.message);
+      throw error;
+    }
+  }
 
   const receipt = await prisma.$transaction(async (tx) => {
-    const existing = await tx.shoppingReceipt.findUnique({ where: { id } });
+    const spaceId = request.space!.spaceId;
+    const existing = await tx.shoppingReceipt.findFirst({ where: { id, spaceId, voidedAt: null } });
     if (!existing) throw new ApiError(404, 'No se encontró el ticket.');
-    const category = await tx.category.findUnique({ where: { id: input.categoryId } });
+    const existingEntry = await tx.financialEntry.findFirst({ where: { id: existing.financialEntryId, spaceId, voidedAt: null }, include: { shares: true } });
+    if (!existingEntry) throw new ApiError(404, 'No se encontró el gasto enlazado al ticket.');
+    const groupSpace = isCoLife ? await tx.space.findUnique({ where: { id: spaceId } }) : null;
+    if (isCoLife && !groupSpace) throw new ApiError(404, 'No se encontró el CoLife.');
+    const category = await tx.category.findFirst({ where: { id: input.categoryId, spaceId } });
     if (!category || category.type !== TransactionType.EXPENSE) throw new ApiError(400, 'Elige una categoría de gasto válida.');
-    const supermarket = await getOrCreateSupermarket(tx, input.supermarketName);
+    if (isCoLife) await assertActiveCoLifeMembers(tx, spaceId, [existingEntry.payerUserId ?? request.auth!.userId, ...allocations.map(({ userId }) => userId)]);
+    const supermarket = await getOrCreateSupermarket(tx, input.supermarketName, spaceId);
     await tx.financialEntry.update({
-      where: { id: existing.financialEntryId },
-      data: { amount: totalCents / 100, description: `Compra ${supermarket.name}`.slice(0, 160), date: input.date, categoryId: category.id },
+      where: { id: existing.financialEntryId, spaceId },
+      data: { amount: centsToDecimal(totalCents), description: `Compra ${supermarket.name}`.slice(0, 160), date: input.date, categoryId: category.id },
     });
-    await tx.shoppingReceiptItem.deleteMany({ where: { receiptId: id } });
+    await tx.shoppingReceiptItem.deleteMany({ where: { receiptId: id, spaceId } });
     await tx.shoppingReceipt.update({ where: { id }, data: { supermarketId: supermarket.id, date: input.date, adjustment: input.adjustment, totalAmount: totalCents / 100 } });
-    const actualLineCents = await replaceReceiptItems(tx, id, input.items);
+    const actualLineCents = await replaceReceiptItems(tx, id, spaceId, input.items);
     if (actualLineCents !== lineCents) throw new ApiError(400, 'No se pudieron validar los importes de las líneas.');
+    if (isCoLife && groupSpace) {
+      await syncExpenseShares(tx, {
+        entryId: existingEntry.id,
+        groupSpace,
+        mode: input.splitMode as AllocationMode,
+        description: `Compra ${supermarket.name}`.slice(0, 160),
+        date: input.date,
+        allocations,
+      });
+      const settlementCount = await tx.settlement.count({ where: { spaceId, createdAt: { gte: existingEntry.createdAt } } });
+      const reconciliationAdjustments = settlementCount && existingEntry.status === 'CONFIRMED'
+        ? await reconcileSettledExpenseCorrection(tx, {
+          spaceId,
+          entryId: existingEntry.id,
+          previous: {
+            payerUserId: existingEntry.payerUserId,
+            totalCents: moneyToCents(existingEntry.amount.toNumber()),
+            shares: existingEntry.shares.filter(({ isActive }) => isActive).map(({ userId, amount }) => ({ userId, amountCents: moneyToCents(amount.toNumber()) })),
+          },
+          replacement: {
+            payerUserId: existingEntry.payerUserId,
+            totalCents,
+            shares: allocations.map(({ userId, amountCents }) => ({ userId, amountCents })),
+          },
+        })
+        : [];
+      await tx.auditEvent.create({
+        data: {
+          spaceId,
+          actorId: request.auth!.userId,
+          entityType: 'SHARED_EXPENSE',
+          entityId: existingEntry.id,
+          action: settlementCount ? 'CORRECTED_AFTER_SETTLEMENT' : 'UPDATED_FROM_RECEIPT',
+          details: JSON.stringify({ receiptId: id, totalCents, splitMode: input.splitMode, allocations, historicalSettlementsPreserved: settlementCount, reconciliationAdjustments }),
+        },
+      });
+    }
     return tx.shoppingReceipt.findUniqueOrThrow({
       where: { id },
-      include: { supermarket: true, financialEntry: { include: { category: true } }, items: { include: { product: true, variant: true } } },
+      include: {
+        supermarket: true,
+        financialEntry: {
+          include: {
+            category: true,
+            shares: {
+              where: { isActive: true },
+              include: { user: { select: { id: true, email: true, displayName: true } } },
+            },
+          },
+        },
+        items: { include: { product: true, variant: true } },
+      },
     });
-  });
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   response.json(receipt);
 }));
 
 shoppingRouter.delete('/receipts/:id', asyncHandler(async (request, response) => {
   const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
   await prisma.$transaction(async (tx) => {
-    const receipt = await tx.shoppingReceipt.findUnique({ where: { id } });
+    const spaceId = request.space!.spaceId;
+    const receipt = await tx.shoppingReceipt.findFirst({ where: { id, spaceId, voidedAt: null } });
     if (!receipt) throw new ApiError(404, 'No se encontró el ticket.');
-    await tx.shoppingReceiptItem.deleteMany({ where: { receiptId: id } });
+    if (request.space!.spaceType === 'COLIFE') {
+      const [entry, groupSpace] = await Promise.all([
+        tx.financialEntry.findFirst({ where: { id: receipt.financialEntryId, spaceId, voidedAt: null }, include: { shares: true } }),
+        tx.space.findUnique({ where: { id: spaceId } }),
+      ]);
+      if (!entry || !groupSpace) throw new ApiError(404, 'No se encontró el gasto compartido enlazado.');
+      const settlementCount = await tx.settlement.count({ where: { spaceId, createdAt: { gte: entry.createdAt } } });
+      const reconciliationAdjustments = settlementCount && entry.status === 'CONFIRMED'
+        ? await reconcileSettledExpenseCorrection(tx, {
+          spaceId,
+          entryId: entry.id,
+          previous: {
+            payerUserId: entry.payerUserId,
+            totalCents: moneyToCents(entry.amount.toNumber()),
+            shares: entry.shares.filter(({ isActive }) => isActive).map(({ userId, amount }) => ({ userId, amountCents: moneyToCents(amount.toNumber()) })),
+          },
+          replacement: null,
+        })
+        : [];
+      await tx.financialEntry.update({ where: { id: entry.id }, data: { voidedAt: new Date() } });
+      await tx.shoppingReceipt.update({ where: { id }, data: { voidedAt: new Date() } });
+      for (const share of entry.shares.filter(({ isActive }) => isActive)) {
+        await tx.expenseShare.update({ where: { id: share.id }, data: { isActive: false } });
+        await syncPersonalMirror(tx, {
+          shareId: share.id,
+          userId: share.userId,
+          groupSpace,
+          description: entry.description,
+          date: entry.date,
+          amountCents: moneyToCents(share.amount.toNumber()),
+          active: false,
+        });
+      }
+      await tx.auditEvent.create({
+        data: {
+          spaceId,
+          actorId: request.auth!.userId,
+          entityType: 'SHARED_EXPENSE',
+          entityId: entry.id,
+          action: 'REVERSED_FROM_RECEIPT',
+          details: JSON.stringify({ receiptId: id, amount: entry.amount.toString(), historicalPaymentsPreserved: true, reconciliationAdjustments }),
+        },
+      });
+      return;
+    }
+    await tx.shoppingReceiptItem.deleteMany({ where: { receiptId: id, spaceId } });
     await tx.shoppingReceipt.delete({ where: { id } });
-    await tx.financialEntry.delete({ where: { id: receipt.financialEntryId } });
-  });
+    await tx.financialEntry.delete({ where: { id: receipt.financialEntryId, spaceId } });
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   response.status(204).end();
 }));
 
 shoppingRouter.get('/compare/:productId', asyncHandler(async (request, response) => {
   const { productId } = z.object({ productId: z.string().min(1) }).parse(request.params);
-  const product = await prisma.shoppingProduct.findUnique({ where: { id: productId } });
+  const spaceId = request.space!.spaceId;
+  const product = await prisma.shoppingProduct.findFirst({ where: { id: productId, spaceId } });
   if (!product) throw new ApiError(404, 'No se encontró el producto.');
   const dimension = product.dimension;
   if (!dimension) {
@@ -321,7 +510,7 @@ shoppingRouter.get('/compare/:productId', asyncHandler(async (request, response)
   if (!dimensions.includes(dimension as typeof dimensions[number])) throw new ApiError(409, 'El producto tiene una dimensión no válida.');
   const comparableDimension = dimension as ShoppingDimension;
   const observations = await prisma.shoppingReceiptItem.findMany({
-    where: { productId, receipt: { supermarket: { active: true } } },
+    where: { spaceId, productId, receipt: { spaceId, voidedAt: null, supermarket: { active: true, spaceId } } },
     include: { receipt: { include: { supermarket: true } }, variant: true },
     orderBy: [{ receipt: { date: 'desc' } }, { createdAt: 'desc' }],
   });

@@ -7,8 +7,182 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model User {
+  id                  String           @id @default(cuid()) @db.NVarChar(30)
+  googleSubject       String           @unique @db.NVarChar(255)
+  email                String           @db.NVarChar(320)
+  displayName          String?          @db.NVarChar(160)
+  avatarUrl            String?          @db.NVarChar(500)
+  createdAt            DateTime         @default(now()) @db.DateTime2
+  updatedAt            DateTime         @updatedAt @db.DateTime2
+  sessions             UserSession[]
+  memberships          Membership[]
+  createdSpaces        Space[]          @relation("SpaceCreator")
+  auditEvents          AuditEvent[]
+  paidEntries          FinancialEntry[] @relation("EntryPayer")
+  paidRules            RecurringRule[]  @relation("RulePayer")
+  shares               ExpenseShare[]
+  recurringShares      RecurringShare[]
+  sentSettlements      Settlement[]     @relation("SettlementSender")
+  receivedSettlements  Settlement[]     @relation("SettlementRecipient")
+  createdSettlements   Settlement[]     @relation("SettlementCreator")
+  createdInvitations   Invitation[]     @relation("InvitationCreator")
+  settlementAdjustments SettlementAdjustment[] @relation("AdjustmentUser")
+}
+
+model UserSession {
+  id            String    @id @default(cuid()) @db.NVarChar(30)
+  userId        String    @db.NVarChar(30)
+  user          User      @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  tokenHash     String    @unique @db.NVarChar(64)
+  csrfTokenHash String    @db.NVarChar(64)
+  createdAt     DateTime  @default(now()) @db.DateTime2
+  expiresAt     DateTime  @db.DateTime2
+  revokedAt     DateTime? @db.DateTime2
+
+  @@index([userId, expiresAt])
+}
+
+model OidcTransaction {
+  id           String   @id @default(cuid()) @db.NVarChar(30)
+  stateHash    String   @unique @db.NVarChar(64)
+  nonce        String   @db.NVarChar(128)
+  pkceVerifier String   @db.NVarChar(128)
+  createdAt    DateTime @default(now()) @db.DateTime2
+  expiresAt    DateTime @db.DateTime2
+
+  @@index([expiresAt])
+}
+
+model Space {
+  id                 String               @id @default(cuid()) @db.NVarChar(30)
+  name               String               @db.NVarChar(100)
+  type               String               @db.NVarChar(16)
+  currency           String               @default("EUR") @db.NVarChar(3)
+  createdByUserId    String?              @db.NVarChar(30)
+  createdBy          User?                @relation("SpaceCreator", fields: [createdByUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  archivedAt         DateTime?            @db.DateTime2
+  createdAt          DateTime             @default(now()) @db.DateTime2
+  updatedAt          DateTime             @updatedAt @db.DateTime2
+  memberships        Membership[]
+  invitation         Invitation?
+  categories         Category[]
+  entries            FinancialEntry[]
+  recurringRules     RecurringRule[]
+  budgets            Budget[]
+  supermarkets       Supermarket[]
+  products           ShoppingProduct[]
+  variants           ShoppingVariant[]
+  receipts           ShoppingReceipt[]
+  receiptItems       ShoppingReceiptItem[]
+  listItems          ShoppingListItem[]
+  auditEvents        AuditEvent[]
+  settlements        Settlement[]
+  settlementAdjustments SettlementAdjustment[]
+  mirroredCategories Category[]           @relation("CoLifeCategorySource")
+
+  @@index([type, archivedAt])
+}
+
+model Membership {
+  id        String    @id @default(cuid()) @db.NVarChar(30)
+  spaceId   String    @db.NVarChar(30)
+  space     Space     @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  userId    String    @db.NVarChar(30)
+  user      User      @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  role      String    @db.NVarChar(16)
+  status    String    @default("ACTIVE") @db.NVarChar(16)
+  joinedAt  DateTime  @default(now()) @db.DateTime2
+  leftAt    DateTime? @db.DateTime2
+  createdAt DateTime  @default(now()) @db.DateTime2
+  updatedAt DateTime  @updatedAt @db.DateTime2
+
+  @@unique([spaceId, userId])
+  @@index([userId, status])
+}
+
+model Invitation {
+  id              String   @id @default(cuid()) @db.NVarChar(30)
+  spaceId         String   @unique @db.NVarChar(30)
+  space           Space    @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  tokenHash       String   @unique @db.NVarChar(64)
+  acceptanceOpen  Boolean  @default(false)
+  createdByUserId String   @db.NVarChar(30)
+  createdBy       User     @relation("InvitationCreator", fields: [createdByUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdAt       DateTime @default(now()) @db.DateTime2
+  updatedAt       DateTime @updatedAt @db.DateTime2
+}
+
+model AuditEvent {
+  id         String   @id @default(cuid()) @db.NVarChar(30)
+  spaceId    String   @db.NVarChar(30)
+  space      Space    @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  actorId    String   @db.NVarChar(30)
+  actor      User     @relation(fields: [actorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  entityType String   @db.NVarChar(40)
+  entityId   String   @db.NVarChar(30)
+  action     String   @db.NVarChar(40)
+  details    String   @db.NVarChar(Max)
+  createdAt  DateTime @default(now()) @db.DateTime2
+
+  @@index([spaceId, createdAt])
+  @@index([entityType, entityId])
+}
+
+model Settlement {
+  id              String   @id @default(cuid()) @db.NVarChar(30)
+  spaceId         String   @db.NVarChar(30)
+  space           Space    @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  fromUserId      String   @db.NVarChar(30)
+  fromUser        User     @relation("SettlementSender", fields: [fromUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  toUserId        String   @db.NVarChar(30)
+  toUser          User     @relation("SettlementRecipient", fields: [toUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdByUserId String   @db.NVarChar(30)
+  createdBy       User     @relation("SettlementCreator", fields: [createdByUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  amount          Decimal  @db.Decimal(12, 2)
+  note            String?  @db.NVarChar(160)
+  paidAt          DateTime @db.DateTime2
+  createdAt       DateTime @default(now()) @db.DateTime2
+
+  @@index([spaceId, paidAt])
+  @@index([fromUserId, toUserId])
+}
+
+model ExpenseShare {
+  id             String          @id @default(cuid()) @db.NVarChar(30)
+  entryId        String          @db.NVarChar(30)
+  entry          FinancialEntry  @relation("EntryShares", fields: [entryId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  userId         String          @db.NVarChar(30)
+  user           User            @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  amount         Decimal         @db.Decimal(12, 2)
+  allocationType String          @db.NVarChar(16)
+  shareBasis     Int?
+  isActive       Boolean         @default(true)
+  mirrorEntry    FinancialEntry? @relation("ShareMirror")
+  createdAt      DateTime        @default(now()) @db.DateTime2
+  updatedAt      DateTime        @updatedAt @db.DateTime2
+
+  @@unique([entryId, userId])
+  @@index([userId, createdAt])
+}
+
+model SettlementAdjustment {
+  id        String   @id @default(cuid()) @db.NVarChar(30)
+  spaceId   String   @db.NVarChar(30)
+  space     Space    @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  userId    String   @db.NVarChar(30)
+  user      User     @relation("AdjustmentUser", fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  amount    Decimal  @db.Decimal(12, 2)
+  reason    String   @db.NVarChar(160)
+  createdAt DateTime @default(now()) @db.DateTime2
+
+  @@index([spaceId, userId, createdAt])
+}
+
 model Category {
   id             String           @id @default(cuid()) @db.NVarChar(30)
+  spaceId        String           @db.NVarChar(30)
+  space          Space            @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   name           String           @db.NVarChar(40)
   type           String           @db.NVarChar(16)
   color          String           @default("#7c8da6") @db.NVarChar(7)
@@ -18,13 +192,19 @@ model Category {
   transactions   FinancialEntry[]
   recurringRules RecurringRule[]
   budgets        Budget[]
+  sourceCoLifeSpaceId String?     @db.NVarChar(30)
+  sourceCoLifeSpace Space?        @relation("CoLifeCategorySource", fields: [sourceCoLifeSpaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
-  @@unique([name, type])
+  @@unique([spaceId, name, type])
   @@index([type])
+  @@index([spaceId, type])
+  @@index([spaceId, sourceCoLifeSpaceId])
 }
 
 model FinancialEntry {
   id              String           @id @default(cuid()) @db.NVarChar(30)
+  spaceId         String           @db.NVarChar(30)
+  space           Space            @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   type            String           @db.NVarChar(16)
   status          String           @default("CONFIRMED") @db.NVarChar(16)
   amount          Decimal          @db.Decimal(12, 2)
@@ -36,16 +216,28 @@ model FinancialEntry {
   recurringRuleId String?          @db.NVarChar(30)
   recurringRule   RecurringRule?   @relation(fields: [recurringRuleId], references: [id], onDelete: SetNull, onUpdate: NoAction)
   scheduledFor    DateTime?        @db.Date
+  payerUserId     String?          @db.NVarChar(30)
+  payer           User?            @relation("EntryPayer", fields: [payerUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  shares          ExpenseShare[]   @relation("EntryShares")
+  derivedShareId  String?          @unique @db.NVarChar(30)
+  derivedShare    ExpenseShare?    @relation("ShareMirror", fields: [derivedShareId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  voidedAt        DateTime?        @db.DateTime2
   createdAt       DateTime         @default(now()) @db.DateTime2
   updatedAt       DateTime         @updatedAt @db.DateTime2
   shoppingReceipt ShoppingReceipt?
 
   @@index([date, type, status])
-  @@index([categoryId, date])
+  @@index([spaceId, date, type, status])
+  @@index([spaceId, categoryId, date])
 }
 
 model RecurringRule {
   id          String           @id @default(cuid()) @db.NVarChar(30)
+  spaceId     String           @db.NVarChar(30)
+  space       Space            @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  payerUserId String?          @db.NVarChar(30)
+  payer       User?            @relation("RulePayer", fields: [payerUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  splitMode   String?          @db.NVarChar(16)
   type        String           @db.NVarChar(16)
   amount      Decimal          @db.Decimal(12, 2)
   description String           @db.NVarChar(160)
@@ -55,15 +247,35 @@ model RecurringRule {
   endDate     DateTime?        @db.Date
   scheduleDay Int
   active      Boolean          @default(true)
+  deletedAt   DateTime?        @db.DateTime2
   entries     FinancialEntry[]
+  shares      RecurringShare[]
   createdAt   DateTime         @default(now()) @db.DateTime2
   updatedAt   DateTime         @updatedAt @db.DateTime2
 
+  @@index([spaceId, active, startDate])
   @@index([active, startDate])
+}
+
+model RecurringShare {
+  id             String        @id @default(cuid()) @db.NVarChar(30)
+  ruleId         String        @db.NVarChar(30)
+  rule           RecurringRule @relation(fields: [ruleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  userId         String        @db.NVarChar(30)
+  user           User          @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  allocationType String        @db.NVarChar(16)
+  shareBasis     Int?
+  exactAmount    Decimal?      @db.Decimal(12, 2)
+  createdAt      DateTime      @default(now()) @db.DateTime2
+
+  @@unique([ruleId, userId])
+  @@index([userId, createdAt])
 }
 
 model Budget {
   id          String   @id @default(cuid()) @db.NVarChar(30)
+  spaceId     String   @db.NVarChar(30)
+  space       Space    @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   categoryId  String   @db.NVarChar(30)
   category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade, onUpdate: NoAction)
   month       DateTime @db.Date
@@ -72,23 +284,30 @@ model Budget {
   updatedAt   DateTime @updatedAt @db.DateTime2
 
   @@unique([categoryId, month])
+  @@index([spaceId, month])
   @@index([month])
 }
 
 model Supermarket {
   id             String            @id @default(cuid()) @db.NVarChar(30)
+  spaceId        String            @db.NVarChar(30)
+  space          Space             @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   name           String            @db.NVarChar(80)
-  normalizedName String            @unique @db.NVarChar(80)
+  normalizedName String            @db.NVarChar(80)
   active         Boolean           @default(true)
   createdAt      DateTime          @default(now()) @db.DateTime2
   updatedAt      DateTime          @updatedAt @db.DateTime2
   receipts       ShoppingReceipt[]
+
+  @@unique([spaceId, normalizedName])
 }
 
 model ShoppingProduct {
   id             String                @id @default(cuid()) @db.NVarChar(30)
+  spaceId        String                @db.NVarChar(30)
+  space          Space                 @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   name           String                @db.NVarChar(100)
-  normalizedName String                @unique @db.NVarChar(100)
+  normalizedName String                @db.NVarChar(100)
   dimension      String?               @db.NVarChar(12)
   active         Boolean               @default(true)
   createdAt      DateTime              @default(now()) @db.DateTime2
@@ -97,11 +316,15 @@ model ShoppingProduct {
   listItem       ShoppingListItem?
   receiptItems   ShoppingReceiptItem[]
 
+  @@unique([spaceId, normalizedName])
+  @@index([spaceId, active, name])
   @@index([active, name])
 }
 
 model ShoppingVariant {
   id                String                @id @default(cuid()) @db.NVarChar(30)
+  spaceId           String                @db.NVarChar(30)
+  space             Space                 @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   productId         String                @db.NVarChar(30)
   product           ShoppingProduct       @relation(fields: [productId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   brand             String?               @db.NVarChar(80)
@@ -113,12 +336,15 @@ model ShoppingVariant {
   updatedAt         DateTime              @updatedAt @db.DateTime2
   receiptItems      ShoppingReceiptItem[]
 
-  @@unique([productId, normalizedBrand, normalizedPackage])
+  @@unique([spaceId, productId, normalizedBrand, normalizedPackage])
+  @@index([spaceId, productId, active])
   @@index([productId, active])
 }
 
 model ShoppingReceipt {
   id               String                @id @default(cuid()) @db.NVarChar(30)
+  spaceId          String                @db.NVarChar(30)
+  space            Space                 @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   supermarketId    String                @db.NVarChar(30)
   supermarket      Supermarket           @relation(fields: [supermarketId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   financialEntryId String                @unique @db.NVarChar(30)
@@ -126,16 +352,21 @@ model ShoppingReceipt {
   date             DateTime              @db.Date
   adjustment       Decimal               @default(0) @db.Decimal(12, 2)
   totalAmount      Decimal               @db.Decimal(12, 2)
+  voidedAt         DateTime?             @db.DateTime2
   createdAt        DateTime              @default(now()) @db.DateTime2
   updatedAt        DateTime              @updatedAt @db.DateTime2
   items            ShoppingReceiptItem[]
 
+  @@index([spaceId, supermarketId, date])
+  @@index([spaceId, date])
   @@index([supermarketId, date])
   @@index([date])
 }
 
 model ShoppingReceiptItem {
   id             String          @id @default(cuid()) @db.NVarChar(30)
+  spaceId        String          @db.NVarChar(30)
+  space          Space           @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   receiptId      String          @db.NVarChar(30)
   receipt        ShoppingReceipt @relation(fields: [receiptId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   productId      String          @db.NVarChar(30)
@@ -155,6 +386,8 @@ model ShoppingReceiptItem {
 
 model ShoppingListItem {
   id        String          @id @default(cuid()) @db.NVarChar(30)
+  spaceId   String          @db.NVarChar(30)
+  space     Space           @relation(fields: [spaceId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   productId String          @unique @db.NVarChar(30)
   product   ShoppingProduct @relation(fields: [productId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   note      String?         @db.NVarChar(160)

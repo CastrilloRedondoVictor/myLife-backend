@@ -3,7 +3,7 @@ export type ShoppingUnit = typeof shoppingUnits[number];
 export type ShoppingDimension = 'WEIGHT' | 'VOLUME' | 'COUNT';
 
 export function normalizeShoppingName(value: string) {
-  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().replace(/\s+/g, ' ').toLocaleLowerCase('es');
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
 export function moneyToCents(value: number) {
